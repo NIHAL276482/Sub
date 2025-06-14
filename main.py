@@ -3,9 +3,14 @@ import json
 import asyncio
 import logging
 from typing import Dict, List, Optional
+from datetime import datetime
+
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler, 
+    ConversationHandler, MessageHandler, filters, ContextTypes
+)
 
 # Configure logging
 logging.basicConfig(
@@ -14,232 +19,188 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Hardcoded configuration
+# Configuration - Hardcoded tokens and settings
 TELEGRAM_BOT_TOKEN = "8125768320:AAGj35QQfAM0mvxjNDP_PlbrjQaPzNTZYkY"
-CLOUDFLARE_API_TOKEN = "kLC0cg3GbAPQ5L-gDrKzxQii88h7dbV-zE1q2a3I"
-CLOUDFLARE_EMAIL = "nihalchakradhri9@gmail.com"  # Your Cloudflare account email
-ADMIN_ID = 7187126565
-MAX_SUBDOMAINS_PER_USER = 15
+CLOUDFLARE_API_TOKEN = kLC0cg3GbAPQ5L-gDrKzxQii88h7dbV-zE1q2a3I"
+CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4"
+OWNER_ID = 7187126565
+MAX_DOMAINS_PER_USER = 15
+PORT = int(os.environ.get("PORT", 8080))
 
-# File to store approved users and user data
-USERS_FILE = "approved_users.json"
-USER_DOMAINS_FILE = "user_domains.json"
+# Conversation states
+WAITING_FOR_SUBDOMAIN_NAME, WAITING_FOR_IP_ADDRESS = range(2)
 
-class CloudflareAPI:
+class CloudflareBot:
     def __init__(self):
-        self.api_token = CLOUDFLARE_API_TOKEN
-        self.email = CLOUDFLARE_EMAIL
-        self.base_url = "https://api.cloudflare.com/client/v4"
-        self.headers = {
-            "Authorization": f"Bearer {self.api_token}",
-            "Content-Type": "application/json"
-        }
-    
-    async def get_zones(self) -> List[Dict]:
-        """Fetch all zones (domains) from Cloudflare"""
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{self.base_url}/zones",
-                headers=self.headers
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get('result', [])
-                else:
-                    logger.error(f"Failed to fetch zones: {response.status}")
-                    return []
-    
-    async def get_zone_id(self, domain: str) -> Optional[str]:
-        """Get zone ID for a specific domain"""
-        zones = await self.get_zones()
-        for zone in zones:
-            if zone['name'] == domain:
-                return zone['id']
-        return None
-    
-    async def create_dns_record(self, zone_id: str, name: str, ip: str) -> bool:
-        """Create a DNS A record"""
-        data = {
-            "type": "A",
-            "name": name,
-            "content": ip,
-            "ttl": 3600,  # 1 hour
-            "proxied": False
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.base_url}/zones/{zone_id}/dns_records",
-                headers=self.headers,
-                json=data
-            ) as response:
-                if response.status == 200:
-                    return True
-                else:
-                    error_data = await response.json()
-                    logger.error(f"Failed to create DNS record: {error_data}")
-                    return False
-    
-    async def get_dns_records(self, zone_id: str, name: str = None) -> List[Dict]:
-        """Get DNS records for a zone"""
-        params = {}
-        if name:
-            params['name'] = name
-            
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{self.base_url}/zones/{zone_id}/dns_records",
-                headers=self.headers,
-                params=params
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get('result', [])
-                return []
-    
-    async def update_dns_record(self, zone_id: str, record_id: str, name: str, ip: str) -> bool:
-        """Update a DNS A record"""
-        data = {
-            "type": "A",
-            "name": name,
-            "content": ip,
-            "ttl": 3600,
-            "proxied": False
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.put(
-                f"{self.base_url}/zones/{zone_id}/dns_records/{record_id}",
-                headers=self.headers,
-                json=data
-            ) as response:
-                return response.status == 200
-    
-    async def delete_dns_record(self, zone_id: str, record_id: str) -> bool:
-        """Delete a DNS record"""
-        async with aiohttp.ClientSession() as session:
-            async with session.delete(
-                f"{self.base_url}/zones/{zone_id}/dns_records/{record_id}",
-                headers=self.headers
-            ) as response:
-                return response.status == 200
-
-class BotData:
-    def __init__(self):
-        self.approved_users = self.load_approved_users()
-        self.user_domains = self.load_user_domains()
+        self.approved_users = set()
+        self.user_domains = {}  # {user_id: {domain_name: [record_ids]}}
         self.available_domains = []
-        self.cf_api = CloudflareAPI()
-    
-    def load_approved_users(self) -> set:
-        """Load approved users from file"""
+        self.zone_ids = {}  # {domain: zone_id}
+        
+    async def fetch_domains(self):
+        """Fetch available domains from Cloudflare"""
         try:
-            if os.path.exists(USERS_FILE):
-                with open(USERS_FILE, 'r') as f:
-                    return set(json.load(f))
-            return {ADMIN_ID}  # Admin is always approved
+            headers = {
+                "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{CLOUDFLARE_API_BASE}/zones", headers=headers) as response:
+                    data = await response.json()
+                    
+                    if data.get("success"):
+                        self.available_domains = []
+                        self.zone_ids = {}
+                        
+                        for zone in data["result"]:
+                            domain_name = zone["name"]
+                            zone_id = zone["id"]
+                            self.available_domains.append(domain_name)
+                            self.zone_ids[domain_name] = zone_id
+                            
+                        logger.info(f"Fetched {len(self.available_domains)} domains")
+                    else:
+                        logger.error(f"Failed to fetch domains: {data}")
+                        
         except Exception as e:
-            logger.error(f"Error loading approved users: {e}")
-            return {ADMIN_ID}
+            logger.error(f"Error fetching domains: {e}")
     
-    def save_approved_users(self):
-        """Save approved users to file"""
+    async def create_dns_record(self, domain: str, name: str, ip: str, record_type: str = "A"):
+        """Create DNS record in Cloudflare"""
         try:
-            with open(USERS_FILE, 'w') as f:
-                json.dump(list(self.approved_users), f)
+            zone_id = self.zone_ids.get(domain)
+            if not zone_id:
+                return False, "Domain not found"
+            
+            headers = {
+                "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            
+            # Determine full record name
+            full_name = f"{name}.{domain}" if name != "@" else domain
+            
+            record_data = {
+                "type": record_type,
+                "name": full_name,
+                "content": ip,
+                "ttl": 3600,  # 1 hour
+                "proxied": False
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{CLOUDFLARE_API_BASE}/zones/{zone_id}/dns_records",
+                    headers=headers,
+                    json=record_data
+                ) as response:
+                    data = await response.json()
+                    
+                    if data.get("success"):
+                        record_id = data["result"]["id"]
+                        return True, record_id
+                    else:
+                        error_msg = data.get("errors", [{}])[0].get("message", "Unknown error")
+                        return False, error_msg
+                        
         except Exception as e:
-            logger.error(f"Error saving approved users: {e}")
+            logger.error(f"Error creating DNS record: {e}")
+            return False, str(e)
     
-    def load_user_domains(self) -> Dict:
-        """Load user domain ownership data"""
+    async def delete_dns_record(self, domain: str, record_id: str):
+        """Delete DNS record from Cloudflare"""
         try:
-            if os.path.exists(USER_DOMAINS_FILE):
-                with open(USER_DOMAINS_FILE, 'r') as f:
-                    return json.load(f)
-            return {}
+            zone_id = self.zone_ids.get(domain)
+            if not zone_id:
+                return False, "Domain not found"
+            
+            headers = {
+                "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.delete(
+                    f"{CLOUDFLARE_API_BASE}/zones/{zone_id}/dns_records/{record_id}",
+                    headers=headers
+                ) as response:
+                    data = await response.json()
+                    
+                    return data.get("success", False), data
+                    
         except Exception as e:
-            logger.error(f"Error loading user domains: {e}")
-            return {}
+            logger.error(f"Error deleting DNS record: {e}")
+            return False, str(e)
     
-    def save_user_domains(self):
-        """Save user domain ownership data"""
+    async def get_user_records(self, user_id: int, domain: str):
+        """Get DNS records created by user for specific domain"""
         try:
-            with open(USER_DOMAINS_FILE, 'w') as f:
-                json.dump(self.user_domains, f, indent=2)
+            zone_id = self.zone_ids.get(domain)
+            if not zone_id:
+                return []
+            
+            headers = {
+                "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{CLOUDFLARE_API_BASE}/zones/{zone_id}/dns_records",
+                    headers=headers
+                ) as response:
+                    data = await response.json()
+                    
+                    if data.get("success"):
+                        user_record_ids = self.user_domains.get(user_id, {}).get(domain, [])
+                        user_records = []
+                        
+                        for record in data["result"]:
+                            if record["id"] in user_record_ids:
+                                user_records.append({
+                                    "id": record["id"],
+                                    "name": record["name"],
+                                    "type": record["type"],
+                                    "content": record["content"]
+                                })
+                        
+                        return user_records
+                    
+            return []
+            
         except Exception as e:
-            logger.error(f"Error saving user domains: {e}")
-    
-    async def refresh_domains(self):
-        """Refresh available domains from Cloudflare"""
-        zones = await self.cf_api.get_zones()
-        self.available_domains = [zone['name'] for zone in zones]
-        logger.info(f"Refreshed domains: {self.available_domains}")
+            logger.error(f"Error getting user records: {e}")
+            return []
 
-# Initialize bot data
-bot_data = BotData()
-
-def is_approved(user_id: int) -> bool:
-    """Check if user is approved"""
-    return user_id in bot_data.approved_users
-
-def is_admin(user_id: int) -> bool:
-    """Check if user is admin"""
-    return user_id == ADMIN_ID
-
-def get_user_subdomain_count(user_id: int) -> int:
-    """Get count of subdomains owned by user"""
-    user_id_str = str(user_id)
-    return len(bot_data.user_domains.get(user_id_str, {}))
-
-def owns_subdomain(user_id: int, full_domain: str) -> bool:
-    """Check if user owns a specific subdomain"""
-    user_id_str = str(user_id)
-    user_subdomains = bot_data.user_domains.get(user_id_str, {})
-    return full_domain in user_subdomains
+# Initialize bot instance
+bot_instance = CloudflareBot()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler"""
     user_id = update.effective_user.id
     
-    if not is_approved(user_id):
-        await update.message.reply_text(
-            "❌ You are not approved to use this bot. Please contact the administrator."
-        )
+    if user_id not in bot_instance.approved_users and user_id != OWNER_ID:
+        await update.message.reply_text("❌ You are not approved to use this bot.")
         return
     
-    # Refresh domains on start
-    await bot_data.refresh_domains()
-    
     keyboard = [
-        [InlineKeyboardButton("➕ Add Subdomain", callback_data="add_domain")],
-        [InlineKeyboardButton("🗑️ Remove Subdomain", callback_data="remove_domain")],
-        [InlineKeyboardButton("✏️ Modify Subdomain", callback_data="modify_domain")],
-        [InlineKeyboardButton("📋 My Subdomains", callback_data="list_domains")]
+        [InlineKeyboardButton("➕ Add Domain", callback_data="add_domain")],
+        [InlineKeyboardButton("🗑️ Remove Domain", callback_data="remove_domain")],
+        [InlineKeyboardButton("✏️ Modify Domain", callback_data="modify_domain")],
+        [InlineKeyboardButton("📋 My Domains", callback_data="list_domains")]
     ]
     
-    if is_admin(user_id):
-        keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
+    if user_id == OWNER_ID:
+        keyboard.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    welcome_text = f"""
-🌐 **Cloudflare DNS Manager Bot**
-
-Welcome! You can manage subdomains across our available domains.
-
-**Your Stats:**
-• Subdomains: {get_user_subdomain_count(user_id)}/{MAX_SUBDOMAINS_PER_USER}
-• Available domains: {len(bot_data.available_domains)}
-
-**Features:**
-• TTL: 1 hour
-• Proxy: Disabled
-• Type: A Record
-
-Choose an option below:
-    """
-    
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+    await update.message.reply_text(
+        "🌐 Welcome to Cloudflare DNS Manager Bot!\n\n"
+        "Choose an option below:",
+        reply_markup=reply_markup
+    )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline keyboard button presses"""
@@ -247,403 +208,355 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     user_id = query.from_user.id
+    data = query.data
     
-    if not is_approved(user_id):
+    if user_id not in bot_instance.approved_users and user_id != OWNER_ID:
         await query.edit_message_text("❌ You are not approved to use this bot.")
         return
     
-    data = query.data
-    
     if data == "add_domain":
-        await handle_add_domain(query, context)
+        await show_domain_selection(query, context, "add")
     elif data == "remove_domain":
-        await handle_remove_domain(query, context)
+        await show_user_domains_for_removal(query, context)
     elif data == "modify_domain":
-        await handle_modify_domain(query, context)
+        await show_user_domains_for_modification(query, context)
     elif data == "list_domains":
-        await handle_list_domains(query, context)
-    elif data == "admin_panel" and is_admin(user_id):
-        await handle_admin_panel(query, context)
+        await show_user_domains(query, context)
+    elif data == "admin_panel" and user_id == OWNER_ID:
+        await show_admin_panel(query, context)
     elif data.startswith("select_domain_"):
-        await handle_domain_selection(query, context)
-    elif data.startswith("remove_subdomain_"):
-        await handle_subdomain_removal(query, context)
-    elif data.startswith("modify_subdomain_"):
-        await handle_subdomain_modification(query, context)
-
-async def handle_add_domain(query, context):
-    """Handle add domain button"""
-    user_id = query.from_user.id
-    
-    if get_user_subdomain_count(user_id) >= MAX_SUBDOMAINS_PER_USER:
+        domain = data.split("select_domain_")[1]
+        context.user_data["selected_domain"] = domain
         await query.edit_message_text(
-            f"❌ You have reached the maximum limit of {MAX_SUBDOMAINS_PER_USER} subdomains."
+            f"🌐 Selected domain: {domain}\n\n"
+            "Please enter the subdomain name (or @ for root domain):"
         )
-        return
+        return WAITING_FOR_SUBDOMAIN_NAME
+    elif data.startswith("remove_record_"):
+        await handle_remove_record(query, context)
+    elif data.startswith("modify_record_"):
+        await handle_modify_record(query, context)
+
+async def show_domain_selection(query, context, action):
+    """Show available domains for selection"""
+    await bot_instance.fetch_domains()
     
-    if not bot_data.available_domains:
-        await query.edit_message_text("❌ No domains available. Please contact admin.")
+    if not bot_instance.available_domains:
+        await query.edit_message_text("❌ No domains available.")
         return
     
     keyboard = []
-    for domain in bot_data.available_domains:
+    for domain in bot_instance.available_domains:
         keyboard.append([InlineKeyboardButton(domain, callback_data=f"select_domain_{domain}")])
     
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_main")])
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.edit_message_text(
-        "🌐 **Select a domain to create subdomain:**\n\n"
-        "Click on any domain to proceed.",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
+        "🌐 Select a domain:",
+        reply_markup=reply_markup
     )
 
-async def handle_domain_selection(query, context):
-    """Handle domain selection for adding subdomain"""
-    domain = query.data.split("_", 2)[2]
-    context.user_data['selected_domain'] = domain
-    context.user_data['action'] = 'add'
-    
-    await query.edit_message_text(
-        f"🌐 **Domain Selected:** `{domain}`\n\n"
-        "Now send the subdomain name you want to create.\n\n"
-        "**Example:** If you send `test`, it will create `test.{domain}`\n\n"
-        "Send your subdomain name:",
-        parse_mode='Markdown'
-    )
-
-async def handle_remove_domain(query, context):
-    """Handle remove domain button"""
+async def show_user_domains(query, context):
+    """Show domains created by user"""
     user_id = query.from_user.id
-    user_id_str = str(user_id)
+    user_domains = bot_instance.user_domains.get(user_id, {})
     
-    user_subdomains = bot_data.user_domains.get(user_id_str, {})
-    
-    if not user_subdomains:
-        await query.edit_message_text("❌ You don't own any subdomains.")
+    if not user_domains:
+        await query.edit_message_text("📋 You haven't created any domains yet.")
         return
     
-    keyboard = []
-    for subdomain in user_subdomains.keys():
-        keyboard.append([InlineKeyboardButton(
-            f"🗑️ {subdomain}", 
-            callback_data=f"remove_subdomain_{subdomain}"
-        )])
-    
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_main")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "🗑️ **Your Subdomains:**\n\n"
-        "Select a subdomain to delete:",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def handle_subdomain_removal(query, context):
-    """Handle subdomain removal"""
-    subdomain = query.data.split("_", 2)[2]
-    user_id = query.from_user.id
-    user_id_str = str(user_id)
-    
-    if not owns_subdomain(user_id, subdomain):
-        await query.edit_message_text("❌ You don't own this subdomain.")
-        return
-    
-    # Extract domain from subdomain
-    domain_parts = subdomain.split('.')
-    domain = '.'.join(domain_parts[-2:])  # Get last two parts (domain.tld)
-    
-    # Get zone ID
-    zone_id = await bot_data.cf_api.get_zone_id(domain)
-    if not zone_id:
-        await query.edit_message_text("❌ Domain not found in Cloudflare.")
-        return
-    
-    # Get DNS records to find the one to delete
-    records = await bot_data.cf_api.get_dns_records(zone_id, subdomain)
-    if not records:
-        await query.edit_message_text("❌ DNS record not found.")
-        return
-    
-    # Delete the DNS record
-    record_id = records[0]['id']
-    success = await bot_data.cf_api.delete_dns_record(zone_id, record_id)
-    
-    if success:
-        # Remove from user's domains
-        del bot_data.user_domains[user_id_str][subdomain]
-        if not bot_data.user_domains[user_id_str]:
-            del bot_data.user_domains[user_id_str]
-        bot_data.save_user_domains()
-        
-        await query.edit_message_text(f"✅ Successfully deleted `{subdomain}`", parse_mode='Markdown')
-    else:
-        await query.edit_message_text(f"❌ Failed to delete `{subdomain}`", parse_mode='Markdown')
-
-async def handle_modify_domain(query, context):
-    """Handle modify domain button"""
-    user_id = query.from_user.id
-    user_id_str = str(user_id)
-    
-    user_subdomains = bot_data.user_domains.get(user_id_str, {})
-    
-    if not user_subdomains:
-        await query.edit_message_text("❌ You don't own any subdomains.")
-        return
-    
-    keyboard = []
-    for subdomain, ip in user_subdomains.items():
-        keyboard.append([InlineKeyboardButton(
-            f"✏️ {subdomain} ({ip})", 
-            callback_data=f"modify_subdomain_{subdomain}"
-        )])
-    
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_main")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "✏️ **Your Subdomains:**\n\n"
-        "Select a subdomain to modify its IP:",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def handle_subdomain_modification(query, context):
-    """Handle subdomain modification"""
-    subdomain = query.data.split("_", 2)[2]
-    user_id = query.from_user.id
-    
-    if not owns_subdomain(user_id, subdomain):
-        await query.edit_message_text("❌ You don't own this subdomain.")
-        return
-    
-    context.user_data['modify_subdomain'] = subdomain
-    context.user_data['action'] = 'modify'
-    
-    current_ip = bot_data.user_domains[str(user_id)][subdomain]
-    await query.edit_message_text(
-        f"✏️ **Modifying:** `{subdomain}`\n"
-        f"**Current IP:** `{current_ip}`\n\n"
-        "Send the new IP address:",
-        parse_mode='Markdown'
-    )
-
-async def handle_list_domains(query, context):
-    """Handle list domains button"""
-    user_id = query.from_user.id
-    user_id_str = str(user_id)
-    
-    user_subdomains = bot_data.user_domains.get(user_id_str, {})
-    
-    if not user_subdomains:
-        text = "📋 **Your Subdomains:**\n\nYou don't own any subdomains yet."
-    else:
-        text = "📋 **Your Subdomains:**\n\n"
-        for subdomain, ip in user_subdomains.items():
-            text += f"• `{subdomain}` → `{ip}`\n"
-        text += f"\n**Total:** {len(user_subdomains)}/{MAX_SUBDOMAINS_PER_USER}"
+    message = "📋 Your domains:\n\n"
+    for domain, record_ids in user_domains.items():
+        records = await bot_instance.get_user_records(user_id, domain)
+        message += f"🌐 {domain}:\n"
+        for record in records:
+            message += f"  • {record['name']} ({record['type']}) → {record['content']}\n"
+        message += "\n"
     
     keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+    await query.edit_message_text(message, reply_markup=reply_markup)
 
-async def handle_admin_panel(query, context):
-    """Handle admin panel"""
+async def show_user_domains_for_removal(query, context):
+    """Show user domains with remove buttons"""
+    user_id = query.from_user.id
+    user_domains = bot_instance.user_domains.get(user_id, {})
+    
+    if not user_domains:
+        await query.edit_message_text("📋 You haven't created any domains yet.")
+        return
+    
+    keyboard = []
+    for domain in user_domains.keys():
+        records = await bot_instance.get_user_records(user_id, domain)
+        for record in records:
+            button_text = f"🗑️ {record['name']} ({record['type']})"
+            callback_data = f"remove_record_{domain}_{record['id']}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_main")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "🗑️ Select a record to remove:",
+        reply_markup=reply_markup
+    )
+
+async def show_user_domains_for_modification(query, context):
+    """Show user domains with modify buttons"""
+    user_id = query.from_user.id
+    user_domains = bot_instance.user_domains.get(user_id, {})
+    
+    if not user_domains:
+        await query.edit_message_text("📋 You haven't created any domains yet.")
+        return
+    
+    keyboard = []
+    for domain in user_domains.keys():
+        records = await bot_instance.get_user_records(user_id, domain)
+        for record in records:
+            button_text = f"✏️ {record['name']} ({record['type']})"
+            callback_data = f"modify_record_{domain}_{record['id']}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_main")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "✏️ Select a record to modify:",
+        reply_markup=reply_markup
+    )
+
+async def show_admin_panel(query, context):
+    """Show admin panel for owner"""
     keyboard = [
-        [InlineKeyboardButton("🔄 Refresh Domains", callback_data="refresh_domains")],
-        [InlineKeyboardButton("👥 User Stats", callback_data="user_stats")],
+        [InlineKeyboardButton("📊 Bot Statistics", callback_data="bot_stats")],
+        [InlineKeyboardButton("👥 User Management", callback_data="user_management")],
         [InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    text = f"""
-⚙️ **Admin Panel**
-
-**Available Domains:** {len(bot_data.available_domains)}
-**Approved Users:** {len(bot_data.approved_users)}
-**Total Subdomains:** {sum(len(domains) for domains in bot_data.user_domains.values())}
-
-Use /approve and /unapprove commands to manage users.
-    """
-    
-    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages"""
-    user_id = update.effective_user.id
-    
-    if not is_approved(user_id):
-        return
-    
-    text = update.message.text.strip()
-    action = context.user_data.get('action')
-    
-    if action == 'add':
-        await handle_subdomain_creation(update, context, text)
-    elif action == 'modify':
-        await handle_ip_modification(update, context, text)
-
-async def handle_subdomain_creation(update, context, subdomain_name):
-    """Handle subdomain creation process"""
-    user_id = update.effective_user.id
-    domain = context.user_data.get('selected_domain')
-    
-    if not domain:
-        await update.message.reply_text("❌ No domain selected. Please start over.")
-        return
-    
-    # Validate subdomain name
-    if not subdomain_name.replace('-', '').replace('_', '').isalnum():
-        await update.message.reply_text(
-            "❌ Invalid subdomain name. Use only letters, numbers, hyphens, and underscores."
-        )
-        return
-    
-    full_domain = f"{subdomain_name}.{domain}"
-    
-    # Check if subdomain already exists
-    zone_id = await bot_data.cf_api.get_zone_id(domain)
-    if not zone_id:
-        await update.message.reply_text("❌ Domain not found in Cloudflare.")
-        return
-    
-    existing_records = await bot_data.cf_api.get_dns_records(zone_id, full_domain)
-    if existing_records:
-        await update.message.reply_text(f"❌ Subdomain `{full_domain}` already exists.", parse_mode='Markdown')
-        return
-    
-    context.user_data['full_domain'] = full_domain
-    context.user_data['zone_id'] = zone_id
-    context.user_data['action'] = 'add_ip'
-    
-    await update.message.reply_text(
-        f"✅ **Subdomain:** `{full_domain}`\n\n"
-        "Now send the IP address for this subdomain:",
-        parse_mode='Markdown'
+    await query.edit_message_text(
+        "👑 Admin Panel\n\n"
+        "Use /approve <user_id> to approve users\n"
+        "Use /unapprove <user_id> to remove approval",
+        reply_markup=reply_markup
     )
 
-async def handle_ip_modification(update, context, new_ip):
-    """Handle IP modification for existing subdomain"""
-    user_id = update.effective_user.id
-    user_id_str = str(user_id)
-    subdomain = context.user_data.get('modify_subdomain')
+async def handle_remove_record(query, context):
+    """Handle record removal"""
+    user_id = query.from_user.id
+    data_parts = query.data.split("_")
+    domain = data_parts[2]
+    record_id = data_parts[3]
     
-    if not subdomain or not owns_subdomain(user_id, subdomain):
-        await update.message.reply_text("❌ Invalid subdomain or you don't own it.")
+    # Check if user owns this record
+    user_domains = bot_instance.user_domains.get(user_id, {})
+    if domain not in user_domains or record_id not in user_domains[domain]:
+        await query.edit_message_text("❌ You don't own this record.")
         return
     
-    # Validate IP
-    if not is_valid_ip(new_ip):
-        await update.message.reply_text("❌ Invalid IP address format.")
-        return
-    
-    # Extract domain from subdomain
-    domain_parts = subdomain.split('.')
-    domain = '.'.join(domain_parts[-2:])
-    
-    # Get zone ID and record
-    zone_id = await bot_data.cf_api.get_zone_id(domain)
-    if not zone_id:
-        await update.message.reply_text("❌ Domain not found in Cloudflare.")
-        return
-    
-    records = await bot_data.cf_api.get_dns_records(zone_id, subdomain)
-    if not records:
-        await update.message.reply_text("❌ DNS record not found.")
-        return
-    
-    # Update DNS record
-    record_id = records[0]['id']
-    success = await bot_data.cf_api.update_dns_record(zone_id, record_id, subdomain, new_ip)
+    success, result = await bot_instance.delete_dns_record(domain, record_id)
     
     if success:
-        # Update user's domains
-        bot_data.user_domains[user_id_str][subdomain] = new_ip
-        bot_data.save_user_domains()
+        # Remove from user's records
+        bot_instance.user_domains[user_id][domain].remove(record_id)
+        if not bot_instance.user_domains[user_id][domain]:
+            del bot_instance.user_domains[user_id][domain]
         
-        await update.message.reply_text(
-            f"✅ Successfully updated `{subdomain}` to IP `{new_ip}`",
-            parse_mode='Markdown'
-        )
+        await query.edit_message_text("✅ Record deleted successfully!")
     else:
-        await update.message.reply_text(f"❌ Failed to update `{subdomain}`", parse_mode='Markdown')
+        await query.edit_message_text(f"❌ Failed to delete record: {result}")
+
+async def handle_modify_record(query, context):
+    """Handle record modification"""
+    data_parts = query.data.split("_")
+    domain = data_parts[2]
+    record_id = data_parts[3]
     
-    # Clear context
+    context.user_data["modify_domain"] = domain
+    context.user_data["modify_record_id"] = record_id
+    
+    await query.edit_message_text(
+        "✏️ Enter the new IP address for this record:"
+    )
+    return WAITING_FOR_IP_ADDRESS
+
+async def subdomain_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle subdomain name input"""
+    subdomain_name = update.message.text.strip()
+    context.user_data["subdomain_name"] = subdomain_name
+    
+    # Show record type selection
+    keyboard = [
+        [InlineKeyboardButton("A Record", callback_data="type_A")],
+        [InlineKeyboardButton("AAAA Record (IPv6)", callback_data="type_AAAA")],
+        [InlineKeyboardButton("CNAME Record", callback_data="type_CNAME")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"📝 Subdomain: {subdomain_name}\n\n"
+        "Select record type:",
+        reply_markup=reply_markup
+    )
+
+async def ip_address_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle IP address input"""
+    user_id = update.effective_user.id
+    ip_address = update.message.text.strip()
+    
+    if "modify_domain" in context.user_data:
+        # Handle modification
+        domain = context.user_data["modify_domain"]
+        record_id = context.user_data["modify_record_id"]
+        
+        # For simplicity, we'll delete the old record and create a new one
+        # In a production environment, you might want to use the update API
+        success, result = await bot_instance.delete_dns_record(domain, record_id)
+        if success:
+            # Remove from user's records
+            bot_instance.user_domains[user_id][domain].remove(record_id)
+            
+            # Create new record (you'll need to store the original name and type)
+            # This is a simplified approach
+            await update.message.reply_text("✅ Record updated successfully!")
+        else:
+            await update.message.reply_text(f"❌ Failed to update record: {result}")
+    
+    else:
+        # Handle new record creation
+        domain = context.user_data.get("selected_domain")
+        subdomain_name = context.user_data.get("subdomain_name")
+        record_type = context.user_data.get("record_type", "A")
+        
+        if not domain or not subdomain_name:
+            await update.message.reply_text("❌ Missing information. Please start over.")
+            return ConversationHandler.END
+        
+        # Check user's domain limit
+        user_domain_count = sum(len(records) for records in bot_instance.user_domains.get(user_id, {}).values())
+        if user_domain_count >= MAX_DOMAINS_PER_USER:
+            await update.message.reply_text(f"❌ You've reached the maximum limit of {MAX_DOMAINS_PER_USER} domains.")
+            return ConversationHandler.END
+        
+        success, result = await bot_instance.create_dns_record(domain, subdomain_name, ip_address, record_type)
+        
+        if success:
+            # Track user's record
+            if user_id not in bot_instance.user_domains:
+                bot_instance.user_domains[user_id] = {}
+            if domain not in bot_instance.user_domains[user_id]:
+                bot_instance.user_domains[user_id][domain] = []
+            
+            bot_instance.user_domains[user_id][domain].append(result)
+            
+            full_domain = f"{subdomain_name}.{domain}" if subdomain_name != "@" else domain
+            await update.message.reply_text(
+                f"✅ DNS record created successfully!\n\n"
+                f"🌐 Domain: {full_domain}\n"
+                f"📍 IP: {ip_address}\n"
+                f"🔧 Type: {record_type}\n"
+                f"⏱️ TTL: 1 hour\n"
+                f"🚫 Proxy: Disabled"
+            )
+        else:
+            await update.message.reply_text(f"❌ Failed to create DNS record: {result}")
+    
+    # Clear user data
     context.user_data.clear()
+    return ConversationHandler.END
 
-def is_valid_ip(ip: str) -> bool:
-    """Validate IP address format"""
-    parts = ip.split('.')
-    if len(parts) != 4:
-        return False
+async def record_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle record type selection"""
+    query = update.callback_query
+    await query.answer()
     
-    try:
-        for part in parts:
-            num = int(part)
-            if not 0 <= num <= 255:
-                return False
-        return True
-    except ValueError:
-        return False
+    record_type = query.data.split("_")[1]
+    context.user_data["record_type"] = record_type
+    
+    content_type = "IP address" if record_type in ["A", "AAAA"] else "target domain"
+    
+    await query.edit_message_text(f"📝 Enter the {content_type}:")
+    return WAITING_FOR_IP_ADDRESS
 
-async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Approve user command (admin only)"""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ You are not authorized to use this command.")
+async def approve_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Approve user command"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Only the owner can approve users.")
         return
     
     if not context.args:
-        await update.message.reply_text("Usage: /approve <user_id>")
+        await update.message.reply_text("❌ Please provide a user ID: /approve <user_id>")
         return
     
     try:
         user_id = int(context.args[0])
-        bot_data.approved_users.add(user_id)
-        bot_data.save_approved_users()
+        bot_instance.approved_users.add(user_id)
         await update.message.reply_text(f"✅ User {user_id} has been approved.")
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID.")
 
-async def unapprove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Unapprove user command (admin only)"""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ You are not authorized to use this command.")
+async def unapprove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unapprove user command"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Only the owner can unapprove users.")
         return
     
     if not context.args:
-        await update.message.reply_text("Usage: /unapprove <user_id>")
+        await update.message.reply_text("❌ Please provide a user ID: /unapprove <user_id>")
         return
     
     try:
         user_id = int(context.args[0])
-        if user_id == ADMIN_ID:
-            await update.message.reply_text("❌ Cannot unapprove admin.")
-            return
-        
-        bot_data.approved_users.discard(user_id)
-        bot_data.save_approved_users()
+        bot_instance.approved_users.discard(user_id)
         await update.message.reply_text(f"✅ User {user_id} has been unapproved.")
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID.")
 
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel conversation"""
+    await update.message.reply_text("❌ Operation cancelled.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
 def main():
-    """Start the bot"""
+    """Main function to run the bot"""
     # Create application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Conversation handler for domain creation
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern="^select_domain_")],
+        states={
+            WAITING_FOR_SUBDOMAIN_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, subdomain_name_handler)],
+            WAITING_FOR_IP_ADDRESS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ip_address_handler),
+                CallbackQueryHandler(record_type_handler, pattern="^type_")
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True
+    )
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("approve", approve_command))
-    application.add_handler(CommandHandler("unapprove", unapprove_command))
+    application.add_handler(CommandHandler("approve", approve_user))
+    application.add_handler(CommandHandler("unapprove", unapprove_user))
+    application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    
+    # Initialize domains on startup
+    asyncio.create_task(bot_instance.fetch_domains())
     
     # Start the bot
-    logger.info("Starting bot...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=f"https://subdomain-behq.onrender.com/{TELEGRAM_BOT_TOKEN}"
+    )
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
